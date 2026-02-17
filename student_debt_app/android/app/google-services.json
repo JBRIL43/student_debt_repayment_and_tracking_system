@@ -1,0 +1,39 @@
+{
+  "project_info": {
+    "project_number": "119600048653",
+    "project_id": "hu-student-debt",
+    "storage_bucket": "hu-student-debt.firebasestorage.app"
+  },
+  "client": [
+    {
+      "client_info": {
+        "mobilesdk_app_id": "1:119600048653:android:b90e76f03dcc7adde38344",
+        "android_client_info": {
+          "package_name": "com.hawassa.studentdebt"
+        }
+      },
+      "oauth_client": [
+        {
+          "client_id": "119600048653-9qpsa2149o2oev23cbsu9lof8udnasme.apps.googleusercontent.com",
+          "client_type": 3
+        }
+      ],
+      "api_key": [
+        {
+          "current_key": "AIzaSyCh0P-6P7pzCPIg1KXjK8M8lXwRaGePqJU"
+        }
+      ],
+      "services": {
+        "appinvite_service": {
+          "other_platform_oauth_client": [
+            {
+              "client_id": "119600048653-9qpsa2149o2oev23cbsu9lof8udnasme.apps.googleusercontent.com",
+              "client_type": 3
+            }
+          ]
+        }
+      }
+    }
+  ],
+  "configuration_version": "1"
+}

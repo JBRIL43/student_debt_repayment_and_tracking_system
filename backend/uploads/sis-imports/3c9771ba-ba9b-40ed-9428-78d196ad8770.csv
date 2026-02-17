@@ -1,0 +1,3 @@
+student_number,full_name,email,phone,department,faculty,batch_year,semesters,program_code,start_year,living_stipend_choice,tuition_base_amount,total_tuition,total_living,total_medical,total_other
+HU2026CS001,Alemu Bekele,alemu@hu.edu.et,+251900000000,Computer Science,Computing,2026,8,CS,2026,Yes,50000,120000,60000,800,0
+HU2026CS002,Marta Tesfaye,marta@hu.edu.et,+251900000001,Information Systems,Computing,2026,8,IS,2026,Yes,50000,120000,60000,800,0

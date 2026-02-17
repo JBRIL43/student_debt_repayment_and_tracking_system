@@ -1,0 +1,10 @@
+nohup: ignoring input
+🚀 Backend server running on http://0.0.0.0:5000
+🌍 Environment: development
+🗄️  Database: localhost:5432/student_debt_system
+✅ Connected to PostgreSQL database
+[2026-02-05T15:23:16.805Z] POST /api/auth/login
+[2026-02-05T15:23:17.931Z] GET /api/debt/balance
+[2026-02-05T15:34:16.489Z] POST /api/auth/login
+[2026-02-05T15:34:16.974Z] GET /api/debt/balance
+[2026-02-05T15:41:55.063Z] GET /api/debt/balance

@@ -1,0 +1,16 @@
+module.exports = {
+  LIVING_STIPEND: {
+    MONTHLY_AMOUNT: 3000.0,
+    MONTHS_PER_SEMESTER: 5,
+  },
+  TUITION_SHARE: {
+    PERCENTAGE: 0.15,
+  },
+  MEDICAL: {
+    YEARLY_AMOUNT: 100.0,
+  },
+  POLICY_RULES: {
+    LIVING_BEFORE_TUITION: true,
+    MAX_PAYMENT_PERIOD: 30,
+  },
+};

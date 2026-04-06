@@ -1,4 +1,5 @@
 import { useMemo, useState, useEffect } from "react";
+import AdminSidebar from "./AdminSidebar";
 
 export type Student = {
   id: string;
@@ -9,21 +10,18 @@ export type Student = {
   createdAt: string;
 };
 
-type DebtRow = {
-  studentId: string;
-  studentNumber: string;
-  fullName: string;
-  department: string;
-  batch: string | null;
-  totalDebt: number;
-  currentBalance: number;
-};
-
 type NotificationItem = {
   id: string;
   type: string;
   message: string;
   created_at: string;
+  is_read?: boolean;
+  is_deleted?: boolean;
+};
+
+type DashboardNotification = NotificationItem & {
+  isRead: boolean;
+  isDeleted: boolean;
 };
 
 type DashboardProps = {
@@ -33,6 +31,7 @@ type DashboardProps = {
   onNavigateAddUser: () => void;
   onNavigateUserList: () => void;
   onNavigateSisImport: () => void;
+  onNavigateReports: () => void;
 };
 
 const API_BASE_URL =
@@ -45,16 +44,11 @@ export default function Dashboard({
   onNavigateAddUser,
   onNavigateUserList,
   onNavigateSisImport,
+  onNavigateReports,
 }: DashboardProps) {
   const [students, setStudents] = useState<Student[]>([]);
-  const [fullName, setFullName] = useState("");
-  const [email, setEmail] = useState("");
-  const [studentNumber, setStudentNumber] = useState("");
-  const [department, setDepartment] = useState("Computer Science");
-  const [password, setPassword] = useState("");
   const [status, setStatus] = useState<string | null>(null);
   const [error, setError] = useState<string | null>(null);
-  const [isSubmitting, setIsSubmitting] = useState(false);
   const [isLoadingStudents, setIsLoadingStudents] = useState(false);
   const [resettingId, setResettingId] = useState<string | null>(null);
   const [deletingId, setDeletingId] = useState<string | null>(null);
@@ -65,10 +59,46 @@ export default function Dashboard({
     pendingVerifications: 0,
   });
   const [statsLoading, setStatsLoading] = useState(false);
-  const [debtRows, setDebtRows] = useState<DebtRow[]>([]);
-  const [isLoadingDebtRows, setIsLoadingDebtRows] = useState(false);
-  const [notifications, setNotifications] = useState<NotificationItem[]>([]);
+  const [notifications, setNotifications] = useState<DashboardNotification[]>(
+    [],
+  );
   const [notificationsOpen, setNotificationsOpen] = useState(false);
+
+  const mapNotifications = (items: NotificationItem[]) => {
+    return items.map((item) => ({
+      id: String(item.id),
+      type: item.type || "INFO",
+      message: item.message || "Notification",
+      created_at: item.created_at || new Date().toISOString(),
+      isRead: Boolean(item.is_read),
+      isDeleted: Boolean(item.is_deleted),
+    }));
+  };
+
+  const fetchNotifications = async () => {
+    try {
+      const response = await fetch(`${API_BASE_URL}/admin/notifications`, {
+        method: "GET",
+        headers: {
+          "Content-Type": "application/json",
+          "x-admin-email": adminEmail,
+          "x-admin-password": adminPassword,
+        },
+      });
+
+      if (!response.ok) {
+        const body = await response.json().catch(() => ({}));
+        const message = body.error || "Failed to load notifications.";
+        throw new Error(message);
+      }
+
+      const body = await response.json();
+      setNotifications(mapNotifications(body.notifications || []));
+    } catch (err) {
+      const message = err instanceof Error ? err.message : "Unknown error";
+      setError(message);
+    }
+  };
 
   const fetchStudents = async () => {
     setIsLoadingStudents(true);
@@ -145,46 +175,8 @@ export default function Dashboard({
     fetchStats();
   }, [adminEmail, adminPassword]);
 
-  const fetchDebtDetails = async () => {
-    setIsLoadingDebtRows(true);
-    try {
-      const response = await fetch(`${API_BASE_URL}/admin/debt-details`, {
-        method: "GET",
-        headers: {
-          "Content-Type": "application/json",
-          "x-admin-email": adminEmail,
-          "x-admin-password": adminPassword,
-        },
-      });
-
-      if (!response.ok) {
-        const body = await response.json().catch(() => ({}));
-        const message = body.error || "Failed to load debt details.";
-        throw new Error(message);
-      }
-
-      const body = await response.json();
-      const mapped = (body.students || []).map((student: any) => ({
-        studentId: String(student.student_id),
-        studentNumber: student.student_number || String(student.student_id),
-        fullName: student.full_name,
-        department: student.department_name || "Unknown",
-        batch: student.batch || null,
-        totalDebt: Number(student.total_debt) || 0,
-        currentBalance: Number(student.current_balance) || 0,
-      }));
-
-      setDebtRows(mapped);
-    } catch (err) {
-      const message = err instanceof Error ? err.message : "Unknown error";
-      setError(message);
-    } finally {
-      setIsLoadingDebtRows(false);
-    }
-  };
-
   useEffect(() => {
-    fetchDebtDetails();
+    fetchNotifications();
   }, [adminEmail, adminPassword]);
 
   useEffect(() => {
@@ -204,20 +196,10 @@ export default function Dashboard({
         if (payload.stats) {
           setStats(payload.stats);
         }
-        if (payload.students) {
-          const mapped = payload.students.map((student: any) => ({
-            studentId: String(student.student_id),
-            studentNumber: student.student_number || String(student.student_id),
-            fullName: student.full_name,
-            department: student.department_name || "Unknown",
-            batch: student.batch || null,
-            totalDebt: Number(student.total_debt) || 0,
-            currentBalance: Number(student.current_balance) || 0,
-          }));
-          setDebtRows(mapped);
-        }
         if (payload.notifications) {
-          setNotifications(payload.notifications);
+          setNotifications(
+            mapNotifications(payload.notifications as NotificationItem[]),
+          );
         }
       } catch (_) {
         // Ignore parse errors for stream payloads
@@ -239,85 +221,86 @@ export default function Dashboard({
     [],
   );
 
-  const canSubmit = useMemo(() => {
-    return (
-      fullName.trim() &&
-      email.trim() &&
-      studentNumber.trim() &&
-      department.trim() &&
-      password.trim()
+  const visibleNotifications = useMemo(
+    () => notifications.filter((item) => !item.isDeleted),
+    [notifications],
+  );
+
+  const unreadNotificationCount = useMemo(
+    () => visibleNotifications.filter((item) => !item.isRead).length,
+    [visibleNotifications],
+  );
+
+  const unreadNotificationBadge =
+    unreadNotificationCount > 99
+      ? "99+"
+      : unreadNotificationCount > 0
+        ? String(unreadNotificationCount)
+        : null;
+
+  const handleMarkNotificationRead = async (notificationId: string) => {
+    setNotifications((prev) =>
+      prev.map((item) =>
+        item.id === notificationId ? { ...item, isRead: true } : item,
+      ),
     );
-  }, [fullName, email, studentNumber, department, password]);
-
-  const resetForm = () => {
-    setFullName("");
-    setEmail("");
-    setStudentNumber("");
-    setDepartment("Computer Science");
-    setPassword("");
-  };
-
-  const handleSubmit = async (event: React.FormEvent) => {
-    event.preventDefault();
-    setStatus(null);
-    setError(null);
-
-    if (!canSubmit) {
-      setError("Please fill in all fields.");
-      return;
-    }
-
-    setIsSubmitting(true);
-
-    const payload = {
-      fullName: fullName.trim(),
-      email: email.trim(),
-      studentNumber: studentNumber.trim(),
-      department: department.trim(),
-      password: password,
-    };
 
     try {
-      const response = await fetch(`${API_BASE_URL}/admin/students`, {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-          "x-admin-email": adminEmail,
-          "x-admin-password": adminPassword,
+      const response = await fetch(
+        `${API_BASE_URL}/admin/notifications/${notificationId}/read`,
+        {
+          method: "PATCH",
+          headers: {
+            "Content-Type": "application/json",
+            "x-admin-email": adminEmail,
+            "x-admin-password": adminPassword,
+          },
         },
-        body: JSON.stringify(payload),
-      });
+      );
 
       if (!response.ok) {
-        const body = await response.json().catch(() => ({}));
-        const message = body.error || "Failed to create student in backend.";
-        throw new Error(message);
+        throw new Error("Failed to mark notification as read.");
       }
-
-      const created = await response.json();
-      const createdStudent = created.student;
-      setStudents((prev) => [
-        {
-          id: String(createdStudent.studentId),
-          fullName: createdStudent.fullName,
-          email: createdStudent.email,
-          studentNumber: createdStudent.studentNumber,
-          department: createdStudent.departmentName || payload.department,
-          createdAt: new Date().toISOString(),
-        },
-        ...prev,
-      ]);
-
-      setStatus("Student created successfully (backend synced).");
-      resetForm();
     } catch (err) {
-      const message = err instanceof Error ? err.message : "Unknown error";
+      const message =
+        err instanceof Error
+          ? err.message
+          : "Failed to mark notification as read.";
       setError(message);
+      fetchNotifications();
+    }
+  };
 
-      setStatus("Student creation failed. Please try again.");
-      resetForm();
-    } finally {
-      setIsSubmitting(false);
+  const handleDeleteNotification = async (notificationId: string) => {
+    setNotifications((prev) =>
+      prev.map((item) =>
+        item.id === notificationId
+          ? { ...item, isDeleted: true, isRead: true }
+          : item,
+      ),
+    );
+
+    try {
+      const response = await fetch(
+        `${API_BASE_URL}/admin/notifications/${notificationId}/delete`,
+        {
+          method: "PATCH",
+          headers: {
+            "Content-Type": "application/json",
+            "x-admin-email": adminEmail,
+            "x-admin-password": adminPassword,
+          },
+        },
+      );
+
+      if (!response.ok) {
+        throw new Error("Failed to delete notification.");
+      }
+    } catch (err) {
+      const message =
+        err instanceof Error ? err.message : "Failed to delete notification.";
+      setError(message);
+      fetchNotifications();
     }
   };
 
@@ -407,34 +390,17 @@ export default function Dashboard({
 
   return (
     <div className="admin-shell">
-      <aside className="sidebar">
-        <div className="sidebar-brand">
-          <div className="brand-mark">HU</div>
-          <div>
-            <p className="brand-title">Admin Panel</p>
-            <p className="brand-subtitle">Hawassa University</p>
-          </div>
-        </div>
-
-        <nav className="sidebar-nav">
-          <button className="nav-item active">Dashboard</button>
-          <button className="nav-item" onClick={onNavigateAddUser}>
-            Manage Users
-          </button>
-          <button className="nav-item" onClick={onNavigateUserList}>
-            User List
-          </button>
-          <button className="nav-item" onClick={onNavigateSisImport}>
-            SIS Import
-          </button>
-          <button className="nav-item">Reports</button>
-          <button className="nav-item">Settings</button>
-        </nav>
-
-        <button className="sidebar-logout" onClick={onLogout}>
-          Logout
-        </button>
-      </aside>
+      <AdminSidebar
+        items={[
+          { label: "Dashboard", active: true },
+          { label: "Manage Users", onClick: onNavigateAddUser },
+          { label: "User List", onClick: onNavigateUserList },
+          { label: "SIS Import", onClick: onNavigateSisImport },
+          { label: "Reports", onClick: onNavigateReports },
+          { label: "Settings" },
+        ]}
+        onLogout={onLogout}
+      />
 
       <main className="admin-main">
         <header className="admin-header">
@@ -452,24 +418,49 @@ export default function Dashboard({
                 type="button"
               >
                 <span className="notification-icon">🔔</span>
-                {notifications.length > 0 && (
+                {unreadNotificationBadge && (
                   <span className="notification-badge">
-                    {notifications.length}
+                    {unreadNotificationBadge}
                   </span>
                 )}
               </button>
               {notificationsOpen && (
                 <div className="notification-panel">
                   <div className="notification-header">Notifications</div>
-                  {notifications.length === 0 && (
+                  {visibleNotifications.length === 0 && (
                     <div className="notification-empty">No updates yet.</div>
                   )}
-                  {notifications.map((item) => (
-                    <div key={item.id} className="notification-item">
+                  {visibleNotifications.map((item) => (
+                    <div
+                      key={item.id}
+                      className={`notification-item${item.isRead ? "" : " unread"}`}
+                    >
                       <p className="notification-message">{item.message}</p>
-                      <span className="notification-time">
-                        {new Date(item.created_at).toLocaleString()}
-                      </span>
+                      <div className="notification-item-footer">
+                        <span className="notification-time">
+                          {new Date(item.created_at).toLocaleString()}
+                        </span>
+                        <div className="notification-actions">
+                          {!item.isRead && (
+                            <button
+                              type="button"
+                              className="notification-action"
+                              onClick={() =>
+                                handleMarkNotificationRead(item.id)
+                              }
+                            >
+                              Mark as read
+                            </button>
+                          )}
+                          <button
+                            type="button"
+                            className="notification-action danger"
+                            onClick={() => handleDeleteNotification(item.id)}
+                          >
+                            Delete
+                          </button>
+                        </div>
+                      </div>
                     </div>
                   ))}
                 </div>
@@ -484,6 +475,9 @@ export default function Dashboard({
             </div>
           </div>
         </header>
+
+        {error && <div className="error">{error}</div>}
+        {status && <div className="status">{status}</div>}
 
         <section className="stats-grid">
           <div className="stat-card">
@@ -513,7 +507,9 @@ export default function Dashboard({
         <section className="quick-actions">
           <h2>Quick Actions</h2>
           <div className="quick-actions-grid">
-            <button className="action-btn">Generate Reports</button>
+            <button className="action-btn" onClick={onNavigateReports}>
+              Generate Reports
+            </button>
             <button className="action-btn" onClick={onNavigateAddUser}>
               Add User
             </button>

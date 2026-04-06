@@ -14,6 +14,28 @@ const DEFAULT_INITIAL_DEBT = 133000.0;
 
 const normalize = (value) => (value || '').trim();
 
+// Helper: retry Firebase createUser on transient network timeouts
+const createUserWithRetry = async (userData, retries = 3) => {
+  for (let i = 0; i < retries; i++) {
+    try {
+      return await admin.auth().createUser({
+        email: userData.email,
+        password: userData.password,
+        displayName: userData.name || userData.displayName || userData.fullName,
+      });
+    } catch (error) {
+      const code = error && (error.code || (error.errorInfo && error.errorInfo.code));
+      const isTimeout = code === 'app/network-timeout' || String(error).toLowerCase().includes('timeout');
+      if (isTimeout && i < retries - 1) {
+        console.log(`CreateUser timeout attempt ${i + 1}, retrying...`);
+        await new Promise((res) => setTimeout(res, 3000));
+        continue;
+      }
+      throw error;
+    }
+  }
+};
+
 const getAdminCredentials = () => ({
   email: process.env.ADMIN_EMAIL,
   password: process.env.ADMIN_PASSWORD,
@@ -120,33 +142,168 @@ const fetchStudentDebtDetails = async () => {
   return result.rows;
 };
 
+const syncNotificationsFromEvents = async () => {
+  await pool.query(
+    `INSERT INTO admin_notifications (source_type, source_key, type, message, event_created_at)
+     SELECT
+       'PAYMENT' AS source_type,
+       CONCAT('payment-', ph.payment_id) AS source_key,
+       'PAYMENT' AS type,
+       CONCAT(u.full_name, ' made a payment of ETB ', ph.amount) AS message,
+       ph.payment_date AS event_created_at
+     FROM payment_history ph
+     JOIN debt_records dr ON dr.debt_id = ph.debt_id
+     JOIN students s ON s.student_id = dr.student_id
+     JOIN users u ON u.user_id = s.user_id
+     WHERE ph.status = 'SUCCESS'
+     ON CONFLICT (source_key)
+     DO UPDATE SET
+       message = EXCLUDED.message,
+       event_created_at = EXCLUDED.event_created_at,
+       updated_at = CURRENT_TIMESTAMP`
+  );
+
+  await pool.query(
+    `INSERT INTO admin_notifications (source_type, source_key, type, message, event_created_at)
+     SELECT
+       'REGISTRATION' AS source_type,
+       CONCAT('user-', u.user_id) AS source_key,
+       'REGISTRATION' AS type,
+       CONCAT(u.full_name, ' registered as a student') AS message,
+       u.created_at AS event_created_at
+     FROM users u
+     WHERE u.role = 'STUDENT'
+     ON CONFLICT (source_key)
+     DO UPDATE SET
+       message = EXCLUDED.message,
+       event_created_at = EXCLUDED.event_created_at,
+       updated_at = CURRENT_TIMESTAMP`
+  );
+};
+
+const ensureAdminNotificationsTable = async () => {
+  await pool.query(
+    `CREATE TABLE IF NOT EXISTS admin_notifications (
+      notification_id BIGSERIAL PRIMARY KEY,
+      source_type VARCHAR(50) NOT NULL,
+      source_key VARCHAR(255) UNIQUE NOT NULL,
+      type VARCHAR(50) NOT NULL,
+      message TEXT NOT NULL,
+      event_created_at TIMESTAMP NOT NULL,
+      is_read BOOLEAN DEFAULT FALSE,
+      is_deleted BOOLEAN DEFAULT FALSE,
+      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+      updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    )`
+  );
+
+  await pool.query(
+    `CREATE INDEX IF NOT EXISTS idx_admin_notifications_event_created_at
+      ON admin_notifications(event_created_at DESC)`
+  );
+
+  await pool.query(
+    `CREATE INDEX IF NOT EXISTS idx_admin_notifications_status
+      ON admin_notifications(is_deleted, is_read)`
+  );
+};
+
 const fetchNotifications = async () => {
+  await ensureAdminNotificationsTable();
+
+  try {
+    await syncNotificationsFromEvents();
+  } catch (syncError) {
+    const syncMessage = syncError instanceof Error ? syncError.message : String(syncError);
+    console.warn('Notification sync skipped:', syncMessage);
+  }
+
   const result = await pool.query(
-    `SELECT * FROM (
-       SELECT
-         CONCAT('payment-', ph.payment_id) AS id,
-         'PAYMENT' AS type,
-         CONCAT(u.full_name, ' made a payment of ETB ', ph.amount) AS message,
-         ph.payment_date AS created_at
-       FROM payment_history ph
-       JOIN debt_records dr ON dr.debt_id = ph.debt_id
-       JOIN students s ON s.student_id = dr.student_id
-       JOIN users u ON u.user_id = s.user_id
-       WHERE ph.status = 'SUCCESS'
-       UNION ALL
-       SELECT
-         CONCAT('user-', u.user_id) AS id,
-         'REGISTRATION' AS type,
-         CONCAT(u.full_name, ' registered as a student') AS message,
-         u.created_at AS created_at
-       FROM users u
-       WHERE u.role = 'STUDENT'
-     ) notifications
-     ORDER BY created_at DESC
-     LIMIT 10`
+    `SELECT
+       notification_id::TEXT AS id,
+       type,
+       message,
+       event_created_at AS created_at,
+       is_read,
+       is_deleted
+     FROM admin_notifications
+     WHERE COALESCE(is_deleted, FALSE) = FALSE
+     ORDER BY event_created_at DESC
+     LIMIT 50`
   );
 
   return result.rows;
+};
+
+exports.getNotifications = async (req, res) => {
+  try {
+    const notifications = await fetchNotifications();
+    return res.json({ notifications });
+  } catch (error) {
+    console.error('Get notifications error:', error);
+    return res.status(500).json({ error: 'Failed to load notifications.' });
+  }
+};
+
+exports.markNotificationRead = async (req, res) => {
+  const notificationId = Number(req.params.notificationId);
+
+  if (!notificationId) {
+    return res.status(400).json({ error: 'Valid notification ID is required.' });
+  }
+
+  try {
+    await ensureAdminNotificationsTable();
+
+    const result = await pool.query(
+      `UPDATE admin_notifications
+       SET is_read = TRUE,
+           updated_at = CURRENT_TIMESTAMP
+       WHERE notification_id = $1
+       RETURNING notification_id::TEXT AS id, is_read, is_deleted`,
+      [notificationId]
+    );
+
+    if (result.rows.length === 0) {
+      return res.status(404).json({ error: 'Notification not found.' });
+    }
+
+    return res.json({ notification: result.rows[0] });
+  } catch (error) {
+    console.error('Mark notification read error:', error);
+    return res.status(500).json({ error: 'Failed to mark notification as read.' });
+  }
+};
+
+exports.deleteNotification = async (req, res) => {
+  const notificationId = Number(req.params.notificationId);
+
+  if (!notificationId) {
+    return res.status(400).json({ error: 'Valid notification ID is required.' });
+  }
+
+  try {
+    await ensureAdminNotificationsTable();
+
+    const result = await pool.query(
+      `UPDATE admin_notifications
+       SET is_deleted = TRUE,
+           is_read = TRUE,
+           updated_at = CURRENT_TIMESTAMP
+       WHERE notification_id = $1
+       RETURNING notification_id::TEXT AS id, is_read, is_deleted`,
+      [notificationId]
+    );
+
+    if (result.rows.length === 0) {
+      return res.status(404).json({ error: 'Notification not found.' });
+    }
+
+    return res.json({ notification: result.rows[0] });
+  } catch (error) {
+    console.error('Delete notification error:', error);
+    return res.status(500).json({ error: 'Failed to delete notification.' });
+  }
 };
 
 exports.requireAdminAuth = (req, res, next) => {
@@ -166,20 +323,55 @@ exports.requireAdminAuth = (req, res, next) => {
 };
 
 exports.requireStaffAuth = (allowedRoles = ['Admin']) => (req, res, next) => {
-  const staffEmail = req.headers['x-admin-email'];
-  const staffPassword = req.headers['x-admin-password'];
-  const staffCreds = getStaffCredentials();
+  return (async () => {
+    const staffEmail = normalize(req.headers['x-admin-email']).toLowerCase();
+    const staffPassword = normalize(req.headers['x-admin-password']);
+    const staffCreds = getStaffCredentials();
 
-  const isAuthorized = allowedRoles.some((role) => {
-    const creds = staffCreds[role];
-    return creds && staffEmail === creds.email && staffPassword === creds.password;
-  });
+    const isAuthorizedByStaticCreds = allowedRoles.some((role) => {
+      const creds = staffCreds[role];
+      return creds && staffEmail === normalize(creds.email).toLowerCase() && staffPassword === normalize(creds.password);
+    });
 
-  if (!isAuthorized) {
-    return res.status(401).json({ error: 'Invalid staff credentials.' });
-  }
+    if (isAuthorizedByStaticCreds) {
+      return next();
+    }
 
-  return next();
+    const roleToDbRole = {
+      'Department Head': 'DEPT_HEAD',
+      'Finance Officer': 'FINANCE_OFFICER',
+      Registrar: 'REGISTRAR_ADMIN',
+    };
+
+    const allowedDbRoles = allowedRoles
+      .map((role) => roleToDbRole[role])
+      .filter(Boolean);
+
+    if (!staffEmail || !allowedDbRoles.length) {
+      return res.status(401).json({ error: 'Invalid staff credentials.' });
+    }
+
+    try {
+      const userResult = await pool.query(
+        `SELECT user_id
+         FROM users
+         WHERE LOWER(email) = LOWER($1)
+           AND role = ANY($2)
+           AND is_active = TRUE
+         LIMIT 1`,
+        [staffEmail, allowedDbRoles]
+      );
+
+      if (userResult.rows.length === 0) {
+        return res.status(401).json({ error: 'Invalid staff credentials.' });
+      }
+
+      return next();
+    } catch (error) {
+      console.error('Staff auth error:', error);
+      return res.status(500).json({ error: 'Failed to validate staff credentials.' });
+    }
+  })();
 };
 
 exports.createStudent = async (req, res) => {
@@ -235,15 +427,11 @@ exports.createStudent = async (req, res) => {
     }
 
     try {
-      firebaseUser = await admin.auth().createUser({
-        email,
-        password,
-        displayName: fullName,
-      });
+      firebaseUser = await createUserWithRetry({ email, password, name: fullName });
     } catch (firebaseError) {
+      await client.query('ROLLBACK');
       console.error('Create student Firebase error:', firebaseError);
-      firebaseWarning =
-        'Student created in database, but Firebase account creation failed.';
+      return res.status(500).json({ error: 'Failed to create Firebase user', details: firebaseError.message });
     }
 
     const userResult = await client.query(
@@ -360,36 +548,39 @@ exports.resetStudentPassword = async (req, res) => {
     const { firebase_uid: firebaseUid, email, full_name: fullName } = result.rows[0];
     let resolvedUid = firebaseUid;
 
+    // Resolve or create the Firebase user first. If this fails, abort.
     if (!resolvedUid) {
       try {
         const existing = await admin.auth().getUserByEmail(email);
         resolvedUid = existing.uid;
       } catch (lookupError) {
-        const created = await admin.auth().createUser({
-          email,
-          password: newPassword,
-          displayName: fullName,
-        });
-        resolvedUid = created.uid;
+        try {
+          const created = await createUserWithRetry({ email, password: newPassword, name: fullName });
+          resolvedUid = created.uid;
+        } catch (createError) {
+          console.error('Reset student password Firebase create error:', createError);
+          return res.status(500).json({ error: 'Failed to resolve or create Firebase user', details: createError.message });
+        }
       }
-
-      await pool.query('UPDATE users SET firebase_uid = $1 WHERE email = $2', [
-        resolvedUid,
-        email,
-      ]);
     }
 
     try {
       await admin.auth().updateUser(resolvedUid, { password: newPassword });
-      return res.json({ success: true });
     } catch (firebaseError) {
       console.error('Reset password Firebase error:', firebaseError);
-      return res.json({
-        success: true,
-        warning:
-          'Password reset stored locally, but Firebase update failed. Check Firebase credentials.',
-      });
+      return res.status(500).json({ error: 'Failed to update Firebase password', details: firebaseError.message });
     }
+
+    // Persist firebase_uid if it was missing
+    if (!firebaseUid && resolvedUid) {
+      try {
+        await pool.query('UPDATE users SET firebase_uid = $1 WHERE email = $2', [resolvedUid, email]);
+      } catch (dbErr) {
+        console.error('Failed to save firebase_uid after password reset:', dbErr);
+      }
+    }
+
+    return res.json({ success: true });
   } catch (error) {
     console.error('Reset password error:', error);
     return res.status(500).json({ error: 'Failed to reset password', details: error.message });
@@ -423,6 +614,37 @@ exports.deleteStudent = async (req, res) => {
 
     const { user_id: userId, firebase_uid: firebaseUid } = result.rows[0];
 
+    // Prevent deletion if student has outstanding debt or pending payments
+    try {
+      const pendingReq = await client.query(
+        `SELECT COUNT(*) AS count FROM payment_requests WHERE student_id = $1 AND status IN ('PENDING','PROCESSING')`,
+        [studentId]
+      );
+      const pendingCount = parseInt(pendingReq.rows[0].count, 10);
+
+      const debtRecord = await client.query(
+        `SELECT COALESCE(current_balance, 0) AS balance FROM debt_records WHERE student_id = $1 LIMIT 1`,
+        [studentId]
+      );
+      const balance = debtRecord.rows.length ? parseFloat(debtRecord.rows[0].balance) : 0;
+
+      const compReq = await client.query(
+        `SELECT COUNT(*) AS count FROM debt_components WHERE student_id = $1 AND status IN ('UNPAID','PARTIALLY_PAID')`,
+        [studentId]
+      );
+      const compCount = parseInt(compReq.rows[0].count, 10);
+
+      if (pendingCount > 0 || balance > 0 || compCount > 0) {
+        await client.query('ROLLBACK');
+        return res.status(400).json({ error: 'Cannot delete student while they have outstanding debt or pending payments.' });
+      }
+
+    } catch (checkErr) {
+      await client.query('ROLLBACK');
+      console.error('Failed to verify student payment state before delete:', checkErr);
+      return res.status(500).json({ error: 'Failed to verify student payment state', details: checkErr.message });
+    }
+
     // Clear FK reference first to avoid users.student_id constraint
     await client.query('UPDATE users SET student_id = NULL WHERE user_id = $1', [userId]);
 
@@ -430,15 +652,18 @@ exports.deleteStudent = async (req, res) => {
     await client.query('DELETE FROM students WHERE student_id = $1', [studentId]);
     await client.query('DELETE FROM users WHERE user_id = $1', [userId]);
 
-    await client.query('COMMIT');
-
+    // Attempt to delete Firebase user before committing; if it fails, rollback.
     if (firebaseUid) {
       try {
         await admin.auth().deleteUser(firebaseUid);
       } catch (firebaseError) {
+        await client.query('ROLLBACK');
         console.error('Failed to delete Firebase user:', firebaseError);
+        return res.status(500).json({ error: 'Failed to delete Firebase user', details: firebaseError.message });
       }
     }
+
+    await client.query('COMMIT');
 
     return res.json({ success: true });
   } catch (error) {
@@ -514,6 +739,418 @@ exports.getStudentDebtDetails = async (_req, res) => {
   }
 };
 
+const resolveDepartmentHead = async (staffEmail) => {
+  const requesterResult = await pool.query(
+    `SELECT u.user_id, u.role, u.department_id, d.department_name
+     FROM users u
+     LEFT JOIN departments d ON d.department_id = u.department_id
+     WHERE LOWER(u.email) = LOWER($1)
+       AND u.is_active = TRUE
+     LIMIT 1`,
+    [staffEmail]
+  );
+
+  if (requesterResult.rows.length === 0) {
+    return { error: `Department head account not found for ${staffEmail}. Ensure this email exists in users with role DEPT_HEAD and an assigned department.`, status: 404 };
+  }
+
+  const requester = requesterResult.rows[0];
+  const normalizedRole = normalize(requester.role)
+    .toUpperCase()
+    .replace(/\s+/g, '_');
+
+  if (normalizedRole !== 'DEPT_HEAD' && normalizedRole !== 'DEPARTMENT_HEAD') {
+    return { error: 'Only department heads can access this resource.', status: 403 };
+  }
+
+  if (!requester.department_id) {
+    return { error: 'Department head is not assigned to a department.', status: 400 };
+  }
+
+  return { requester };
+};
+
+exports.getDepartmentStudents = async (req, res) => {
+  const staffEmail = normalize(req.headers['x-admin-email']).toLowerCase();
+
+  if (!staffEmail) {
+    return res.status(400).json({ error: 'Staff email header is required.' });
+  }
+
+  try {
+    const { requester, error, status } = await resolveDepartmentHead(staffEmail);
+    if (!requester) {
+      return res.status(status).json({ error });
+    }
+
+    const studentsResult = await pool.query(
+      `SELECT
+         s.student_id,
+         s.student_number,
+         u.full_name,
+         u.email,
+         d.department_name,
+         COALESCE(dr.current_balance, 0) AS current_balance
+       FROM students s
+       JOIN users u ON u.user_id = s.user_id
+       LEFT JOIN departments d ON d.department_id = s.department_id
+       LEFT JOIN debt_records dr ON dr.student_id = s.student_id
+       WHERE u.is_active = TRUE
+         AND s.department_id = $1
+       ORDER BY u.full_name ASC
+       LIMIT 500`,
+      [requester.department_id]
+    );
+
+    return res.json({
+      success: true,
+      department: requester.department_name,
+      students: studentsResult.rows,
+    });
+  } catch (error) {
+    console.error('Department students error:', error);
+    return res.status(500).json({ error: 'Failed to fetch department students', details: error.message });
+  }
+};
+
+exports.getDepartmentPaymentRequests = async (req, res) => {
+  const staffEmail = normalize(req.headers['x-admin-email']).toLowerCase();
+
+  if (!staffEmail) {
+    return res.status(400).json({ error: 'Staff email header is required.' });
+  }
+
+  try {
+    const { requester, error, status } = await resolveDepartmentHead(staffEmail);
+    if (!requester) {
+      return res.status(status).json({ error });
+    }
+
+    const result = await pool.query(
+      `SELECT
+         pr.request_id,
+         pr.student_id,
+         pr.requested_amount,
+         pr.payment_method,
+         pr.semester,
+         pr.academic_year,
+         pr.component_type,
+         pr.requested_at,
+         pr.status,
+         CASE
+           WHEN pr.status = 'PENDING' THEN 'PENDING_DEPT_REVIEW'
+           WHEN pr.status = 'APPROVED' THEN 'APPROVED_BY_DEPT'
+           WHEN pr.status = 'VERIFIED' THEN 'VERIFIED_BY_FINANCE'
+           WHEN pr.status = 'REJECTED' THEN 'REJECTED'
+           ELSE 'UNKNOWN'
+         END AS workflow_stage,
+         u.full_name,
+         u.email,
+         s.student_number,
+         s.enrollment_status,
+         d.department_name
+       FROM payment_requests pr
+       JOIN students s ON s.student_id = pr.student_id
+       JOIN users u ON u.user_id = s.user_id
+       LEFT JOIN departments d ON d.department_id = s.department_id
+       WHERE s.department_id = $1
+         AND pr.status = 'PENDING'
+       ORDER BY pr.requested_at DESC NULLS LAST, pr.requested_date DESC
+       LIMIT 200`,
+      [requester.department_id]
+    );
+
+    return res.json({
+      success: true,
+      department: requester.department_name,
+      requests: result.rows,
+    });
+  } catch (error) {
+    console.error('Department payment requests error:', error);
+    return res.status(500).json({ error: 'Failed to fetch department payment requests', details: error.message });
+  }
+};
+
+exports.approveDepartmentEnrollment = async (req, res) => {
+  const staffEmail = normalize(req.headers['x-admin-email']).toLowerCase();
+  const requestId = Number(req.params.requestId);
+
+  if (!staffEmail) {
+    return res.status(400).json({ error: 'Staff email header is required.' });
+  }
+
+  if (!requestId) {
+    return res.status(400).json({ error: 'requestId is required.' });
+  }
+
+  const client = await pool.connect();
+  try {
+    const { requester, error, status } = await resolveDepartmentHead(staffEmail);
+    if (!requester) {
+      return res.status(status).json({ error });
+    }
+
+    await client.query('BEGIN');
+
+    const reqResult = await client.query(
+      `SELECT pr.request_id, pr.student_id, pr.status, s.department_id, s.enrollment_status
+       FROM payment_requests pr
+       JOIN students s ON s.student_id = pr.student_id
+       WHERE pr.request_id = $1
+       FOR UPDATE`,
+      [requestId]
+    );
+
+    if (!reqResult.rows.length) {
+      await client.query('ROLLBACK');
+      return res.status(404).json({ error: 'Payment request not found.' });
+    }
+
+    const paymentRequest = reqResult.rows[0];
+
+    if (paymentRequest.department_id !== requester.department_id) {
+      await client.query('ROLLBACK');
+      return res.status(403).json({ error: 'You can only approve requests from your own department.' });
+    }
+
+    if (paymentRequest.status !== 'PENDING') {
+      await client.query('ROLLBACK');
+      return res.status(400).json({ error: 'Only pending requests can be approved for finance verification.' });
+    }
+
+    if (normalize(paymentRequest.enrollment_status).toUpperCase() !== 'ACTIVE') {
+      await client.query('ROLLBACK');
+      return res.status(400).json({ error: 'Student is not in active enrollment status.' });
+    }
+
+    await client.query(
+      `UPDATE payment_requests
+       SET status = 'APPROVED', approved_by = $1, approval_date = NOW(), rejection_reason = NULL
+       WHERE request_id = $2`,
+      [requester.user_id, requestId]
+    );
+
+    await client.query('COMMIT');
+    return res.json({ success: true, message: 'Academic eligibility approved and sent to Finance verification.' });
+  } catch (error) {
+    await client.query('ROLLBACK');
+    console.error('Approve department enrollment error:', error);
+    return res.status(500).json({ error: 'Failed to approve enrollment', details: error.message });
+  } finally {
+    client.release();
+  }
+};
+
+exports.rejectDepartmentEnrollment = async (req, res) => {
+  const staffEmail = normalize(req.headers['x-admin-email']).toLowerCase();
+  const requestId = Number(req.params.requestId);
+  const reason = normalize(req.body?.reason) || 'Not academically eligible.';
+
+  if (!staffEmail) {
+    return res.status(400).json({ error: 'Staff email header is required.' });
+  }
+
+  if (!requestId) {
+    return res.status(400).json({ error: 'requestId is required.' });
+  }
+
+  const client = await pool.connect();
+  try {
+    const { requester, error, status } = await resolveDepartmentHead(staffEmail);
+    if (!requester) {
+      return res.status(status).json({ error });
+    }
+
+    await client.query('BEGIN');
+
+    const reqResult = await client.query(
+      `SELECT pr.request_id, pr.status, s.department_id
+       FROM payment_requests pr
+       JOIN students s ON s.student_id = pr.student_id
+       WHERE pr.request_id = $1
+       FOR UPDATE`,
+      [requestId]
+    );
+
+    if (!reqResult.rows.length) {
+      await client.query('ROLLBACK');
+      return res.status(404).json({ error: 'Payment request not found.' });
+    }
+
+    const paymentRequest = reqResult.rows[0];
+
+    if (paymentRequest.department_id !== requester.department_id) {
+      await client.query('ROLLBACK');
+      return res.status(403).json({ error: 'You can only reject requests from your own department.' });
+    }
+
+    if (paymentRequest.status !== 'PENDING') {
+      await client.query('ROLLBACK');
+      return res.status(400).json({ error: 'Only pending requests can be rejected.' });
+    }
+
+    await client.query(
+      `UPDATE payment_requests
+       SET status = 'REJECTED', approved_by = $1, approval_date = NOW(), rejection_reason = $2
+       WHERE request_id = $3`,
+      [requester.user_id, reason, requestId]
+    );
+
+    await client.query('COMMIT');
+    return res.json({ success: true, message: 'Request rejected based on academic eligibility.' });
+  } catch (error) {
+    await client.query('ROLLBACK');
+    console.error('Reject department enrollment error:', error);
+    return res.status(500).json({ error: 'Failed to reject enrollment', details: error.message });
+  } finally {
+    client.release();
+  }
+};
+
+exports.getReportSummary = async (req, res) => {
+  try {
+    const now = new Date();
+    const defaultFrom = new Date(now);
+    defaultFrom.setDate(defaultFrom.getDate() - 30);
+
+    const fromInput = req.query.from ? new Date(req.query.from) : defaultFrom;
+    const toInput = req.query.to ? new Date(req.query.to) : now;
+
+    if (Number.isNaN(fromInput.getTime()) || Number.isNaN(toInput.getTime())) {
+      return res.status(400).json({ error: 'Invalid from/to date query parameters.' });
+    }
+
+    const fromDate = new Date(fromInput);
+    fromDate.setHours(0, 0, 0, 0);
+
+    const toDate = new Date(toInput);
+    toDate.setHours(23, 59, 59, 999);
+
+    if (fromDate > toDate) {
+      return res.status(400).json({ error: 'The from date must be before the to date.' });
+    }
+
+    const [
+      summaryResult,
+      methodBreakdownResult,
+      departmentBreakdownResult,
+      recentPaymentsResult,
+      dashboardStats,
+    ] = await Promise.all([
+      pool.query(
+        `SELECT
+           COUNT(*)::int AS successful_payments,
+           COALESCE(SUM(amount), 0)::numeric AS total_collections,
+           COALESCE(AVG(amount), 0)::numeric AS average_payment
+         FROM payment_history
+         WHERE status = 'SUCCESS'
+           AND payment_date BETWEEN $1 AND $2`,
+        [fromDate, toDate]
+      ),
+      pool.query(
+        `SELECT
+           COALESCE(payment_method, 'UNKNOWN') AS payment_method,
+           COUNT(*)::int AS payment_count,
+           COALESCE(SUM(amount), 0)::numeric AS total_amount
+         FROM payment_history
+         WHERE status = 'SUCCESS'
+           AND payment_date BETWEEN $1 AND $2
+         GROUP BY COALESCE(payment_method, 'UNKNOWN')
+         ORDER BY total_amount DESC`,
+        [fromDate, toDate]
+      ),
+      pool.query(
+        `SELECT
+           COALESCE(d.department_name, 'Unknown') AS department_name,
+           COUNT(*)::int AS payment_count,
+           COALESCE(SUM(ph.amount), 0)::numeric AS total_amount
+         FROM payment_history ph
+         JOIN debt_records dr ON dr.debt_id = ph.debt_id
+         JOIN students s ON s.student_id = dr.student_id
+         LEFT JOIN departments d ON d.department_id = s.department_id
+         WHERE ph.status = 'SUCCESS'
+           AND ph.payment_date BETWEEN $1 AND $2
+         GROUP BY COALESCE(d.department_name, 'Unknown')
+         ORDER BY total_amount DESC`,
+        [fromDate, toDate]
+      ),
+      pool.query(
+        `SELECT
+           ph.payment_id,
+           ph.amount,
+           ph.payment_method,
+           ph.transaction_ref,
+           ph.status,
+           ph.payment_date,
+           u.full_name,
+           s.student_number,
+           COALESCE(d.department_name, 'Unknown') AS department_name
+         FROM payment_history ph
+         JOIN debt_records dr ON dr.debt_id = ph.debt_id
+         JOIN students s ON s.student_id = dr.student_id
+         JOIN users u ON u.user_id = s.user_id
+         LEFT JOIN departments d ON d.department_id = s.department_id
+         WHERE ph.status = 'SUCCESS'
+           AND ph.payment_date BETWEEN $1 AND $2
+         ORDER BY ph.payment_date DESC
+         LIMIT 200`,
+        [fromDate, toDate]
+      ),
+      fetchDashboardStats(),
+    ]);
+
+    const summary = summaryResult.rows[0] || {
+      successful_payments: 0,
+      total_collections: 0,
+      average_payment: 0,
+    };
+
+    return res.json({
+      success: true,
+      range: {
+        from: fromDate.toISOString(),
+        to: toDate.toISOString(),
+      },
+      summary: {
+        successfulPayments: Number(summary.successful_payments || 0),
+        totalCollections: Number(summary.total_collections || 0),
+        averagePayment: Number(summary.average_payment || 0),
+        outstandingDebt: Number(dashboardStats.outstandingDebt || 0),
+        pendingApprovals: Number(dashboardStats.pendingApprovals || 0),
+      },
+      breakdown: {
+        byMethod: methodBreakdownResult.rows.map((row) => ({
+          paymentMethod: row.payment_method,
+          paymentCount: Number(row.payment_count || 0),
+          totalAmount: Number(row.total_amount || 0),
+        })),
+        byDepartment: departmentBreakdownResult.rows.map((row) => ({
+          departmentName: row.department_name,
+          paymentCount: Number(row.payment_count || 0),
+          totalAmount: Number(row.total_amount || 0),
+        })),
+      },
+      recentPayments: recentPaymentsResult.rows.map((row) => ({
+        paymentId: Number(row.payment_id),
+        studentName: row.full_name,
+        studentNumber: row.student_number,
+        departmentName: row.department_name,
+        amount: Number(row.amount || 0),
+        paymentMethod: row.payment_method,
+        transactionRef: row.transaction_ref,
+        paymentDate: row.payment_date,
+        status: row.status,
+      })),
+    });
+  } catch (error) {
+    console.error('Report summary error:', error);
+    return res.status(500).json({
+      error: 'Failed to generate report summary',
+      details: process.env.NODE_ENV === 'development' ? error.message : undefined,
+    });
+  }
+};
+
 exports.streamAdminDashboard = async (req, res) => {
   const adminEmail = req.query.email;
   const adminPassword = req.query.password;
@@ -573,23 +1210,26 @@ exports.resetUserPassword = async (req, res) => {
     const { firebase_uid: firebaseUid, email, full_name: fullName } = result.rows[0];
     let resolvedUid = firebaseUid;
 
+    // Ensure Firebase user exists or create one first
     if (!resolvedUid) {
       try {
         const existing = await admin.auth().getUserByEmail(email);
         resolvedUid = existing.uid;
       } catch (lookupError) {
-        const created = await admin.auth().createUser({
-          email,
-          password: newPassword,
-          displayName: fullName,
-        });
-        resolvedUid = created.uid;
+        try {
+          const created = await createUserWithRetry({ email, password: newPassword, name: fullName });
+          resolvedUid = created.uid;
+        } catch (createError) {
+          console.error('Reset user password - failed to ensure Firebase user:', createError);
+          return res.status(500).json({ error: 'Failed to resolve or create Firebase user', details: createError.message });
+        }
       }
 
-      await pool.query('UPDATE users SET firebase_uid = $1 WHERE user_id = $2', [
-        resolvedUid,
-        userId,
-      ]);
+      try {
+        await pool.query('UPDATE users SET firebase_uid = $1 WHERE user_id = $2', [resolvedUid, userId]);
+      } catch (dbErr) {
+        console.error('Failed to persist firebase_uid during password reset:', dbErr);
+      }
     }
 
     try {
@@ -597,11 +1237,7 @@ exports.resetUserPassword = async (req, res) => {
       return res.json({ success: true });
     } catch (firebaseError) {
       console.error('Reset user password Firebase error:', firebaseError);
-      return res.json({
-        success: true,
-        warning:
-          'Password reset stored locally, but Firebase update failed. Check Firebase credentials.',
-      });
+      return res.status(500).json({ error: 'Failed to update Firebase password', details: firebaseError.message });
     }
   } catch (error) {
     console.error('Reset user password error:', error);
@@ -634,21 +1270,54 @@ exports.deleteUser = async (req, res) => {
     const { firebase_uid: firebaseUid, student_id: studentId } = result.rows[0];
 
     if (studentId) {
+      // Prevent deletion if the student has outstanding debt or pending payments
+      try {
+        const pendingReq = await client.query(
+          `SELECT COUNT(*) AS count FROM payment_requests WHERE student_id = $1 AND status IN ('PENDING','PROCESSING')`,
+          [studentId]
+        );
+        const pendingCount = parseInt(pendingReq.rows[0].count, 10);
+
+        const debtRecord = await client.query(
+          `SELECT COALESCE(current_balance, 0) AS balance FROM debt_records WHERE student_id = $1 LIMIT 1`,
+          [studentId]
+        );
+        const balance = debtRecord.rows.length ? parseFloat(debtRecord.rows[0].balance) : 0;
+
+        const compReq = await client.query(
+          `SELECT COUNT(*) AS count FROM debt_components WHERE student_id = $1 AND status IN ('UNPAID','PARTIALLY_PAID')`,
+          [studentId]
+        );
+        const compCount = parseInt(compReq.rows[0].count, 10);
+
+        if (pendingCount > 0 || balance > 0 || compCount > 0) {
+          await client.query('ROLLBACK');
+          return res.status(400).json({ error: 'Cannot delete user while they have outstanding debt or pending payments.' });
+        }
+      } catch (checkErr) {
+        await client.query('ROLLBACK');
+        console.error('Failed to verify student payment state before user delete:', checkErr);
+        return res.status(500).json({ error: 'Failed to verify student payment state', details: checkErr.message });
+      }
+
       await client.query('UPDATE users SET student_id = NULL WHERE user_id = $1', [userId]);
       await client.query('DELETE FROM students WHERE student_id = $1', [studentId]);
     }
 
     await client.query('DELETE FROM users WHERE user_id = $1', [userId]);
 
-    await client.query('COMMIT');
-
+    // Attempt to delete Firebase user before committing; if it fails, rollback.
     if (firebaseUid) {
       try {
         await admin.auth().deleteUser(firebaseUid);
       } catch (firebaseError) {
+        await client.query('ROLLBACK');
         console.error('Failed to delete Firebase user:', firebaseError);
+        return res.status(500).json({ error: 'Failed to delete Firebase user', details: firebaseError.message });
       }
     }
+
+    await client.query('COMMIT');
 
     return res.json({ success: true });
   } catch (error) {
@@ -665,7 +1334,7 @@ exports.updateUser = async (req, res) => {
   const fullName = normalize(req.body.fullName);
   const email = normalize(req.body.email).toLowerCase();
   const departmentName = normalize(req.body.department);
-  const studentNumber = normalize(req.body.studentNumber);
+  const requestedStudentNumber = normalize(req.body.studentNumber);
 
   if (!userId) {
     return res.status(400).json({ error: 'User ID is required.' });
@@ -693,6 +1362,7 @@ exports.updateUser = async (req, res) => {
     }
 
     const user = existing.rows[0];
+    const studentNumber = user.role === 'STUDENT' ? requestedStudentNumber : '';
 
     if (email && email !== user.email) {
       const emailCheck = await client.query(
@@ -753,8 +1423,27 @@ exports.updateUser = async (req, res) => {
       );
     }
 
-    await client.query('COMMIT');
+    // Sync with Firebase
+    const firebaseUidResult = await client.query(
+      'SELECT firebase_uid FROM users WHERE user_id = $1',
+      [userId]
+    );
+    const firebaseUid = firebaseUidResult.rows.length ? firebaseUidResult.rows[0].firebase_uid : null;
+    if (firebaseUid) {
+      try {
+        await admin.auth().updateUser(firebaseUid, {
+          email,
+          displayName: fullName,
+        });
+      } catch (firebaseError) {
+        console.error('Firebase updateUser error:', firebaseError);
+        // Optionally, return a warning in the response
+        await client.query('COMMIT');
+        return res.json({ success: true, warning: 'Local update succeeded, but Firebase update failed.' });
+      }
+    }
 
+    await client.query('COMMIT');
     return res.json({ success: true });
   } catch (error) {
     await client.query('ROLLBACK');
@@ -939,7 +1628,7 @@ exports.createUser = async (req, res) => {
   const email = normalize(req.body.email).toLowerCase();
   const role = normalize(req.body.role);
   const departmentName = normalize(req.body.department);
-  const studentNumber = normalize(req.body.studentNumber);
+  const requestedStudentNumber = normalize(req.body.studentNumber);
   const password = normalize(req.body.password);
 
   const allowedRoles = [
@@ -956,6 +1645,8 @@ exports.createUser = async (req, res) => {
   if (!allowedRoles.includes(role)) {
     return res.status(400).json({ error: 'Invalid role provided.' });
   }
+
+  const studentNumber = role === 'STUDENT' ? requestedStudentNumber : '';
 
   if (role === 'STUDENT' && (!studentNumber || !departmentName)) {
     return res.status(400).json({ error: 'Student number and department are required for students.' });
@@ -1011,15 +1702,11 @@ exports.createUser = async (req, res) => {
     }
 
     try {
-      firebaseUser = await admin.auth().createUser({
-        email,
-        password,
-        displayName: fullName,
-      });
+      firebaseUser = await createUserWithRetry({ email, password, name: fullName });
     } catch (firebaseError) {
+      await client.query('ROLLBACK');
       console.error('Create user Firebase error:', firebaseError);
-      firebaseWarning =
-        'User created in database, but Firebase account creation failed.';
+      return res.status(500).json({ error: 'Failed to create Firebase user', details: firebaseError.message });
     }
 
     const userResult = await client.query(

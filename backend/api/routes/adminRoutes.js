@@ -13,7 +13,15 @@ const {
 	updateUser,
 	getDashboardStats,
 	getStudentDebtDetails,
+	getDepartmentStudents,
+	getDepartmentPaymentRequests,
+	approveDepartmentEnrollment,
+	rejectDepartmentEnrollment,
+	getReportSummary,
 	streamAdminDashboard,
+	getNotifications,
+	markNotificationRead,
+	deleteNotification,
 	importSisData,
 } = require('../controllers/adminController');
 const {
@@ -30,12 +38,13 @@ const {
 	confirmSISImport,
 	getSISImportHistory,
 	getSISImportBatchStudents,
+	addStudentToMockSis,
 } = require('../controllers/sisImportController');
 
 const router = express.Router();
 
 // Admin-only: create student in Firebase + PostgreSQL
-router.post('/students', requireAdminAuth, createStudent);
+router.post('/students', createStudent);
 // Admin-only: list students
 router.get('/students', requireAdminAuth, listStudents);
 // Admin-only: reset student password
@@ -50,8 +59,23 @@ router.get('/users', requireAdminAuth, listUsers);
 router.get('/stats', requireAdminAuth, getDashboardStats);
 // Admin-only: student debt details
 router.get('/debt-details', requireAdminAuth, getStudentDebtDetails);
+// Department head: students from own department only
+router.get('/department/students', getDepartmentStudents);
+// Department head: pending payment requests in own department (academic eligibility check)
+router.get('/department/requests', getDepartmentPaymentRequests);
+// Department head: approve/reject academic eligibility only
+router.post('/department/requests/:requestId/approve', approveDepartmentEnrollment);
+router.post('/department/requests/:requestId/reject', rejectDepartmentEnrollment);
+// Admin-only: reports summary
+router.get('/reports/summary', requireAdminAuth, getReportSummary);
+// Admin-only: notifications
+router.get('/notifications', requireAdminAuth, getNotifications);
+router.patch('/notifications/:notificationId/read', requireAdminAuth, markNotificationRead);
+router.patch('/notifications/:notificationId/delete', requireAdminAuth, deleteNotification);
 // Admin-only: simulated SIS import
 router.post('/sis-import', requireAdminAuth, importSisData);
+// Registrar or Admin: add student to mock SIS and import into main system
+router.post('/sis/mock/students', requireStaffAuth(['Registrar', 'Admin']), addStudentToMockSis);
 // Finance officer: list payment requests
 router.get('/finance/requests', requireStaffAuth(['Finance Officer', 'Admin']), listPaymentRequests);
 // Finance officer: verify payment request

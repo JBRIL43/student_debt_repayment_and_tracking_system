@@ -18,6 +18,7 @@ function App() {
     | "add-user"
     | "list-users"
     | "sis-import"
+    | "reports"
     | "finance"
     | "registrar"
     | "department"
@@ -247,6 +248,7 @@ function App() {
       onNavigateAddUser={() => setActiveView("add-user")}
       onNavigateUserList={() => setActiveView("list-users")}
       onNavigateSisImport={() => setActiveView("sis-import")}
+      onNavigateReports={() => setActiveView("reports")}
     />
   );
 }

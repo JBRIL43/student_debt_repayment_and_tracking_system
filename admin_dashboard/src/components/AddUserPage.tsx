@@ -116,6 +116,8 @@ export default function AddUserPage({
         throw new Error(message);
       }
 
+      const body = await response.json().catch(() => ({}));
+
       setStatus(
         body.warning
           ? `User created. ${body.warning}`
